@@ -24,7 +24,8 @@ import {
     View,
 } from 'react-native';
 
-    import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/firebase';
+    import { ensureBankAccountForUser } from '@/lib/bank';
+import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/firebase';
 
     WebBrowser.maybeCompleteAuthSession();
 
@@ -212,6 +213,7 @@ import {
             result.user.displayName ?? '',
             result.user.email ?? ''
             );
+            await ensureBankAccountForUser(result.user.uid);
 
             setGoogleProfile(profile);
             onLoginSuccess(
@@ -272,11 +274,16 @@ import {
             { merge: true }
             );
 
+            await ensureBankAccountForUser(created.user.uid);
+
             onLoginSuccess(`Account created for ${fullName.trim()}.`);
             return;
         }
 
         await signInWithEmailAndPassword(auth, email.trim(), password);
+        if (auth.currentUser?.uid) {
+            await ensureBankAccountForUser(auth.currentUser.uid);
+        }
         onLoginSuccess(`Signed in as ${email.trim()}.`);
         } catch (error) {
         showStatus(getAuthErrorMessage(error), 'error');
@@ -305,6 +312,7 @@ import {
             result.user.displayName ?? '',
             result.user.email ?? ''
             );
+            await ensureBankAccountForUser(result.user.uid);
 
             setGoogleProfile(profile);
             onLoginSuccess(

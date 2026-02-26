@@ -36,6 +36,13 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 The login screen now uses Firebase Authentication (email/password + Google) and writes user records to Firestore in the `users` collection.
 
+## Virtual bank account model
+
+- Each authenticated user gets a unique virtual bank account number (example: `BMxxxxxx....`).
+- Virtual bank balance and transactions are stored per user in Firestore.
+- In Home (`/(tabs)`), you can link an account by account number, and subscription deductions will use that linked bank account.
+- If cloud access is blocked/unavailable, the app falls back to local device storage.
+
 In the output, you'll find options to open the app in a
 
 - [development build](https://docs.expo.dev/develop/development-builds/introduction/)

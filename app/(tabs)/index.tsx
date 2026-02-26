@@ -3,30 +3,32 @@ import { router } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import {
-    addDoc,
-    collection,
-    deleteDoc,
-    doc,
-    onSnapshot,
-    orderBy,
-    query,
-    serverTimestamp,
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  setDoc,
 } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Modal,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 
-import { tryDeductVirtualMoney } from '@/lib/bank';
+import { getLinkedBankBalanceByAccountNumber } from '@/lib/bank-bridge';
 import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/firebase';
 
 type BillingCycle = 'monthly' | 'yearly';
@@ -50,6 +52,14 @@ type SubscriptionDoc = {
 };
 
 const LOCAL_SUBSCRIPTIONS_KEY = 'billmate:local-subscriptions';
+
+function normalizeAccountNumber(value: string): string {
+  return value.trim().toUpperCase().replace(/\s+/g, '');
+}
+
+function isValidAccountNumber(value: string): boolean {
+  return /^BM[A-Z0-9]{6,}$/.test(value);
+}
 
 function parseDateInput(value: string): Date | null {
   const trimmed = value.trim();
@@ -172,6 +182,12 @@ export default function HomeScreen() {
   const [cloudSubscriptions, setCloudSubscriptions] = useState<SubscriptionItem[]>([]);
   const [localSubscriptions, setLocalSubscriptions] = useState<SubscriptionItem[]>([]);
   const [loadingSubscriptions, setLoadingSubscriptions] = useState(false);
+  const [bankAccountInput, setBankAccountInput] = useState('');
+  const [linkedBankAccountNumber, setLinkedBankAccountNumber] = useState<string | null>(null);
+  const [linkingBankAccount, setLinkingBankAccount] = useState(false);
+  const [linkedBankBalance, setLinkedBankBalance] = useState<number | null>(null);
+  const [loadingLinkedBankBalance, setLoadingLinkedBankBalance] = useState(false);
+  const [linkedBankBalanceMessage, setLinkedBankBalanceMessage] = useState<string | null>(null);
 
   const subscriptions = currentUser ? [...localSubscriptions, ...cloudSubscriptions] : localSubscriptions;
 
@@ -297,6 +313,47 @@ export default function HomeScreen() {
     return unsubscribeSubscriptions;
   }, [currentUser]);
 
+  useEffect(() => {
+    const loadLinkedBankAccount = async () => {
+      if (!currentUser || !firebaseConfigured) {
+        setLinkedBankAccountNumber(null);
+        setBankAccountInput('');
+        return;
+      }
+
+      try {
+        const userSnapshot = await getDoc(doc(db, 'users', currentUser.uid));
+        const linked = userSnapshot.data()?.linkedBankAccountNumber;
+        const normalizedLinked = typeof linked === 'string' && linked.trim() ? normalizeAccountNumber(linked) : null;
+        setLinkedBankAccountNumber(normalizedLinked);
+        setBankAccountInput(normalizedLinked ?? '');
+      } catch {
+        setLinkedBankAccountNumber(null);
+      }
+    };
+
+    void loadLinkedBankAccount();
+  }, [currentUser]);
+
+  useEffect(() => {
+    const loadLinkedBalance = async () => {
+      if (!linkedBankAccountNumber) {
+        setLinkedBankBalance(null);
+        setLinkedBankBalanceMessage(null);
+        setLoadingLinkedBankBalance(false);
+        return;
+      }
+
+      setLoadingLinkedBankBalance(true);
+      const result = await getLinkedBankBalanceByAccountNumber(linkedBankAccountNumber);
+      setLinkedBankBalance(result.balance);
+      setLinkedBankBalanceMessage(result.message ?? null);
+      setLoadingLinkedBankBalance(false);
+    };
+
+    void loadLinkedBalance();
+  }, [linkedBankAccountNumber]);
+
   const upcomingRenewals = useMemo(
     () =>
       subscriptions
@@ -356,6 +413,80 @@ export default function HomeScreen() {
     }
   };
 
+  const onLinkBankAccount = async () => {
+    setStatus(null);
+
+    if (!currentUser) {
+      setStatus({ type: 'error', message: 'Login required to link a bank account.' });
+      return;
+    }
+
+    if (!firebaseConfigured) {
+      setStatus({ type: 'error', message: `Firebase not configured: ${missingFirebaseEnvKeys.join(', ')}` });
+      return;
+    }
+
+    const normalized = normalizeAccountNumber(bankAccountInput);
+    if (!isValidAccountNumber(normalized)) {
+      setStatus({ type: 'error', message: 'Enter a valid account number (example: BM12345678).' });
+      return;
+    }
+
+    setLinkingBankAccount(true);
+    try {
+      await setDoc(
+        doc(db, 'users', currentUser.uid),
+        {
+          linkedBankAccountNumber: normalized,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      setLinkedBankAccountNumber(normalized);
+      setBankAccountInput(normalized);
+      setStatus({ type: 'success', message: 'Bank account linked in BillMate.' });
+    } catch {
+      setStatus({ type: 'error', message: 'Unable to link bank account right now.' });
+    } finally {
+      setLinkingBankAccount(false);
+    }
+  };
+
+  const onUnlinkBankAccount = async () => {
+    setStatus(null);
+
+    if (!currentUser) {
+      setStatus({ type: 'error', message: 'Login required to unlink bank account.' });
+      return;
+    }
+
+    if (!firebaseConfigured) {
+      setStatus({ type: 'error', message: `Firebase not configured: ${missingFirebaseEnvKeys.join(', ')}` });
+      return;
+    }
+
+    setLinkingBankAccount(true);
+    try {
+      await setDoc(
+        doc(db, 'users', currentUser.uid),
+        {
+          linkedBankAccountNumber: null,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      setLinkedBankAccountNumber(null);
+      setBankAccountInput('');
+      setStatus({ type: 'success', message: 'Bank account unlinked from BillMate.' });
+    } catch {
+      setStatus({ type: 'error', message: 'Unable to unlink bank account right now.' });
+    } finally {
+      setLinkingBankAccount(false);
+    }
+  };
+
   const resetForm = () => {
     setPlatformName('');
     setAmountValue('');
@@ -392,15 +523,6 @@ export default function HomeScreen() {
       return;
     }
 
-    const deduction = await tryDeductVirtualMoney(parsedAmount, `Subscription: ${trimmedPlatform}`);
-    if (!deduction.ok) {
-      setStatus({
-        type: 'error',
-        message: `${deduction.message ?? 'Insufficient balance.'} Add money in Bank to continue.`,
-      });
-      return;
-    }
-
     const payload = {
       platform: trimmedPlatform,
       amount: parsedAmount,
@@ -418,7 +540,7 @@ export default function HomeScreen() {
         setCloudSyncBlocked(false);
         setStatus({
           type: 'success',
-          message: `Subscription added. Remaining balance: ${deduction.state.balance.toFixed(2)}`,
+          message: 'Subscription added.',
         });
       } catch {
         const localItem: SubscriptionItem = {
@@ -429,7 +551,7 @@ export default function HomeScreen() {
         setCloudSyncBlocked(true);
         setStatus({
           type: 'success',
-          message: `Subscription added locally. Cloud save blocked by Firestore permissions. Remaining balance: ${deduction.state.balance.toFixed(2)}`,
+          message: 'Subscription added locally. Cloud save blocked by Firestore permissions.',
         });
       }
     } else {
@@ -442,7 +564,7 @@ export default function HomeScreen() {
         type: 'success',
         message: currentUser
           ? `Firebase not configured: ${missingFirebaseEnvKeys.join(', ')}`
-          : `Subscription added locally. Log in to sync with cloud. Remaining balance: ${deduction.state.balance.toFixed(2)}`,
+          : 'Subscription added locally. Log in to sync with cloud.',
       });
     }
 
@@ -668,9 +790,47 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={styles.bankLinkButton} onPress={() => router.push('/bank')}>
-        <Text style={styles.buttonText}>Go to Bank</Text>
-      </TouchableOpacity>
+      <View style={styles.accountCard}>
+        <Text style={styles.accountTitle}>Linked Bank Account</Text>
+        <Text style={styles.accountMeta}>Linked number: {linkedBankAccountNumber ?? 'Not linked'}</Text>
+        {linkedBankAccountNumber ? (
+          loadingLinkedBankBalance ? (
+            <Text style={styles.accountMeta}>Linked balance: Loading...</Text>
+          ) : linkedBankBalance !== null ? (
+            <Text style={styles.accountMeta}>Linked balance: {linkedBankBalance.toFixed(2)}</Text>
+          ) : (
+            <Text style={styles.accountMeta}>Linked balance: Not available</Text>
+          )
+        ) : null}
+        {linkedBankBalanceMessage ? (
+          <Text style={styles.accountWarning}>{linkedBankBalanceMessage}</Text>
+        ) : null}
+
+        <TextInput
+          style={styles.input}
+          placeholder="Enter account number (BM...)"
+          placeholderTextColor="#8a8aa3"
+          autoCapitalize="characters"
+          value={bankAccountInput}
+          onChangeText={setBankAccountInput}
+        />
+
+        <View style={styles.accountActionRow}>
+          <TouchableOpacity
+            style={[styles.secondaryButton, styles.accountActionButton, linkingBankAccount && styles.buttonDisabled]}
+            onPress={onLinkBankAccount}
+            disabled={linkingBankAccount}>
+            <Text style={styles.buttonText}>{linkingBankAccount ? 'Linking...' : 'Link Account'}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.authButton, styles.accountActionButton, linkingBankAccount && styles.buttonDisabled]}
+            onPress={onUnlinkBankAccount}
+            disabled={linkingBankAccount}>
+            <Text style={styles.buttonText}>Unlink</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
 
       {status ? (
         <Text style={[styles.statusText, status.type === 'error' ? styles.statusError : styles.statusSuccess]}>
@@ -806,12 +966,36 @@ const styles = StyleSheet.create({
   navButtonActive: {
     backgroundColor: '#5b58ff',
   },
-  bankLinkButton: {
-    backgroundColor: '#287d5a',
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: 'center',
+  accountCard: {
+    borderWidth: 1,
+    borderColor: '#2d2d4d',
+    backgroundColor: '#17172a',
+    borderRadius: 12,
+    padding: 12,
     marginBottom: 14,
+  },
+  accountTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  accountMeta: {
+    color: '#c7c7d1',
+    fontSize: 13,
+    marginBottom: 6,
+  },
+  accountWarning: {
+    color: '#ffd27a',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  accountActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  accountActionButton: {
+    flex: 1,
   },
   primaryButton: {
     backgroundColor: '#5b58ff',

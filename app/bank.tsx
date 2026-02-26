@@ -1,30 +1,59 @@
 import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { useCallback, useState } from 'react';
+import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
+import { useCallback, useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 
-import { addVirtualMoney, getBankState, type BankState } from '@/lib/bank';
+import {
+  addVirtualMoney,
+  getBankState,
+  getLinkedBankAccountInfo,
+  type BankState,
+  type LinkedBankAccountInfo,
+} from '@/lib/bank';
+import { auth } from '@/lib/firebase';
 
 export default function BankScreen() {
+  const [authReady, setAuthReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [bankState, setBankState] = useState<BankState | null>(null);
+  const [bankAccountInfo, setBankAccountInfo] = useState<LinkedBankAccountInfo>({
+    ownAccountNumber: null,
+    linkedAccountNumber: null,
+    linkedAccountOwnerUid: null,
+  });
   const [amountInput, setAmountInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<{ type: 'error' | 'success'; message: string } | null>(null);
 
   const loadBank = useCallback(async () => {
     setLoading(true);
-    const state = await getBankState();
-    setBankState(state);
-    setLoading(false);
+    try {
+      const [state, info] = await Promise.all([getBankState(), getLinkedBankAccountInfo()]);
+      setBankState(state);
+      setBankAccountInfo(info);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthReady(true);
+    });
+
+    return unsubscribeAuth;
   }, []);
 
   useFocusEffect(
@@ -32,6 +61,31 @@ export default function BankScreen() {
       void loadBank();
     }, [loadBank])
   );
+
+  useEffect(() => {
+    if (authReady) {
+      void loadBank();
+    }
+  }, [authReady, currentUser, loadBank]);
+
+  const onAuthButtonPress = async () => {
+    setStatus(null);
+
+    if (!currentUser) {
+      router.push('/login');
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+      await signOut(auth);
+      setStatus({ type: 'success', message: 'Logged out successfully.' });
+    } catch {
+      setStatus({ type: 'error', message: 'Unable to log out right now.' });
+    } finally {
+      setAuthLoading(false);
+    }
+  };
 
   const onAddMoney = async () => {
     setStatus(null);
@@ -54,9 +108,33 @@ export default function BankScreen() {
     <ScrollView contentContainerStyle={styles.container}>
       <View style={styles.topRow}>
         <Text style={styles.title}>Virtual Bank</Text>
-        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-          <Text style={styles.buttonText}>Back</Text>
-        </TouchableOpacity>
+        <View style={styles.topActions}>
+          <TouchableOpacity
+            style={[styles.authButton, authLoading && styles.buttonDisabled]}
+            onPress={onAuthButtonPress}
+            disabled={authLoading}>
+            <Text style={styles.buttonText}>
+              {currentUser ? (authLoading ? 'Logging out...' : 'Logout') : 'Login / Sign Up'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
+            <Text style={styles.buttonText}>Back</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <View style={styles.accountCard}>
+        <Text style={styles.accountTitle}>Bank Account</Text>
+        {!authReady ? (
+          <Text style={styles.accountMeta}>Loading account...</Text>
+        ) : !currentUser ? (
+          <Text style={styles.accountMeta}>Login / Sign Up to generate and view your account number.</Text>
+        ) : (
+          <>
+            <Text style={styles.accountMeta}>Account number: {bankAccountInfo.ownAccountNumber ?? 'Generating...'}</Text>
+            <Text style={styles.accountMeta}>Linked account: {bankAccountInfo.linkedAccountNumber ?? 'Not linked'}</Text>
+          </>
+        )}
       </View>
 
       <View style={styles.balanceCard}>
@@ -120,16 +198,49 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 14,
   },
+  topActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   title: {
     color: '#ffffff',
-    fontSize: 30,
+    fontSize: 28,
     fontWeight: '800',
+  },
+  authButton: {
+    backgroundColor: '#2d2d4d',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   backButton: {
     backgroundColor: '#2d2d4d',
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
+  },
+  buttonDisabled: {
+    opacity: 0.7,
+  },
+  accountCard: {
+    borderWidth: 1,
+    borderColor: '#2d2d4d',
+    borderRadius: 12,
+    backgroundColor: '#17172a',
+    padding: 14,
+    marginBottom: 14,
+  },
+  accountTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  accountMeta: {
+    color: '#c7c7d1',
+    fontSize: 13,
+    marginBottom: 4,
   },
   balanceCard: {
     borderWidth: 1,
