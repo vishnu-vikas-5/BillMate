@@ -21,6 +21,12 @@ export type AddVirtualMoneyResult = {
   persistedToCloud: boolean;
 };
 
+export type TransferResult = {
+  ok: boolean;
+  message: string;
+  state: BankState;
+};
+
 const LOCAL_BANK_KEY_PREFIX = 'bankapp:bank-state:';
 const LOCAL_ACCOUNT_KEY_PREFIX = 'bankapp:account-number:';
 
@@ -101,6 +107,42 @@ async function getLocalBankState(uid: string): Promise<BankState> {
 
 async function saveLocalBankState(uid: string, state: BankState): Promise<void> {
   await AsyncStorage.setItem(localBankKey(uid), JSON.stringify(state));
+}
+
+async function saveCloudBankState(uid: string, state: BankState): Promise<boolean> {
+  if (!firebaseConfigured || !db) {
+    return false;
+  }
+
+  try {
+    await setDoc(doc(db, 'users', uid), {
+      bankState: state,
+      bankUpdatedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getUidByAccountNumber(accountNumber: string): Promise<string | null> {
+  if (!firebaseConfigured || !db) {
+    return null;
+  }
+
+  try {
+    const normalized = accountNumber.trim().toUpperCase();
+    if (!normalized) {
+      return null;
+    }
+
+    const snapshot = await getDoc(doc(db, 'bankAccounts', normalized));
+    const uid = snapshot.data()?.uid;
+    return typeof uid === 'string' && uid.trim() ? uid : null;
+  } catch {
+    return null;
+  }
 }
 
 async function syncAccountNumberToCloud(uid: string, accountNumber: string): Promise<void> {
@@ -330,5 +372,118 @@ export async function addVirtualMoney(amount: number, note = 'Added money'): Pro
   return {
     state: nextState,
     persistedToCloud: false,
+  };
+}
+
+export async function transferToAccountByNumber(
+  targetAccountNumber: string,
+  amount: number,
+  note = 'QR payment'
+): Promise<TransferResult> {
+  const senderUid = auth?.currentUser?.uid;
+  if (!senderUid) {
+    return {
+      ok: false,
+      message: 'You must be logged in to make payment.',
+      state: defaultBankState,
+    };
+  }
+
+  const normalizedTarget = targetAccountNumber.trim().toUpperCase();
+  if (!/^BM[A-Z0-9]{6,}$/.test(normalizedTarget)) {
+    const senderState = await getBankState();
+    return {
+      ok: false,
+      message: 'Invalid receiver account number.',
+      state: senderState,
+    };
+  }
+
+  const senderAccountNumber = await ensureBankAccountForUser(senderUid);
+  if (senderAccountNumber && senderAccountNumber.trim().toUpperCase() === normalizedTarget) {
+    const senderState = await getBankState();
+    return {
+      ok: false,
+      message: 'You cannot pay your own account.',
+      state: senderState,
+    };
+  }
+
+  const safeAmount = Number.isFinite(amount) ? amount : 0;
+  const senderState = await getBankState();
+  if (safeAmount <= 0) {
+    return {
+      ok: false,
+      message: 'Enter a valid amount.',
+      state: senderState,
+    };
+  }
+
+  if (senderState.balance < safeAmount) {
+    return {
+      ok: false,
+      message: `Insufficient balance. Available: ${senderState.balance.toFixed(2)}`,
+      state: senderState,
+    };
+  }
+
+  const receiverUid = await getUidByAccountNumber(normalizedTarget);
+  if (!receiverUid) {
+    return {
+      ok: false,
+      message: 'Receiver account not found.',
+      state: senderState,
+    };
+  }
+
+  const receiverSnapshot = await getDoc(doc(db!, 'users', receiverUid));
+  const receiverState = normalizeState(receiverSnapshot.data()?.bankState);
+
+  const senderNextState: BankState = {
+    balance: senderState.balance - safeAmount,
+    transactions: [
+      {
+        id: `tx-${Date.now()}-debit`,
+        type: 'debit',
+        amount: safeAmount,
+        note: `${note} to ${normalizedTarget}`,
+        createdAt: new Date().toISOString(),
+      },
+      ...senderState.transactions,
+    ],
+  };
+
+  const receiverNextState: BankState = {
+    balance: receiverState.balance + safeAmount,
+    transactions: [
+      {
+        id: `tx-${Date.now()}-credit`,
+        type: 'credit',
+        amount: safeAmount,
+        note: `${note} from ${senderAccountNumber ?? senderUid}`,
+        createdAt: new Date().toISOString(),
+      },
+      ...receiverState.transactions,
+    ],
+  };
+
+  const senderSaved = await saveCloudBankState(senderUid, senderNextState);
+  const receiverSaved = await saveCloudBankState(receiverUid, receiverNextState);
+
+  await saveLocalBankState(senderUid, senderNextState);
+  await saveLocalBankState(receiverUid, receiverNextState);
+
+  if (!senderSaved || !receiverSaved) {
+    return {
+      ok: false,
+      message: 'Payment partially saved locally. Cloud sync failed.',
+      state: senderNextState,
+    };
+  }
+
+  return {
+    ok: true,
+    message: `Payment successful: ${safeAmount.toFixed(2)} to ${normalizedTarget}`,
+    state: senderNextState,
   };
 }

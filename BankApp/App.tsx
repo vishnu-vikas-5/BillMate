@@ -1,3 +1,5 @@
+import { CameraView, useCameraPermissions, type BarcodeScanningResult } from 'expo-camera';
+import * as Clipboard from 'expo-clipboard';
 import { StatusBar } from 'expo-status-bar';
 import {
     createUserWithEmailAndPassword,
@@ -12,6 +14,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
     ActivityIndicator,
     KeyboardAvoidingView,
+    Modal,
     Platform,
     ScrollView,
     StyleSheet,
@@ -20,16 +23,79 @@ import {
     TouchableOpacity,
     View,
 } from 'react-native';
+import QRCode from 'react-native-qrcode-svg';
 
 import {
     addVirtualMoney,
     ensureBankAccountForUser,
     getBankState,
+    transferToAccountByNumber,
     type BankState,
 } from './lib/bank';
 import { auth, firebaseConfigured, missingFirebaseEnvKeys } from './lib/firebase';
 
 type AuthMode = 'login' | 'signup';
+
+function parsePaymentQr(rawValue: string): { accountNumber: string; amount?: number } | null {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const bmAccountRegex = /BM[A-Z0-9]{6,}/i;
+
+  const parseAmount = (value: string | null | undefined): number | undefined => {
+    if (!value) {
+      return undefined;
+    }
+
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  };
+
+  try {
+    const parsed = JSON.parse(trimmed) as {
+      accountNumber?: unknown;
+      amount?: unknown;
+    };
+
+    if (typeof parsed.accountNumber === 'string') {
+      const accountNumber = parsed.accountNumber.trim().toUpperCase();
+      if (bmAccountRegex.test(accountNumber)) {
+        return {
+          accountNumber,
+          amount: parseAmount(String(parsed.amount ?? '')),
+        };
+      }
+    }
+  } catch {
+  }
+
+  if (trimmed.startsWith('bank://') || trimmed.startsWith('billmate://')) {
+    try {
+      const parsedUrl = new URL(trimmed);
+      const account = parsedUrl.searchParams.get('account')?.trim().toUpperCase();
+      if (account && bmAccountRegex.test(account)) {
+        return {
+          accountNumber: account,
+          amount: parseAmount(parsedUrl.searchParams.get('amount')),
+        };
+      }
+    } catch {
+    }
+  }
+
+  const accountMatch = trimmed.toUpperCase().match(bmAccountRegex);
+  if (!accountMatch) {
+    return null;
+  }
+
+  const amountMatch = trimmed.match(/(?:amount|amt)\s*[:=]\s*([0-9]+(?:\.[0-9]{1,2})?)/i) ?? trimmed.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
+  return {
+    accountNumber: accountMatch[0],
+    amount: parseAmount(amountMatch?.[1]),
+  };
+}
 
 function getAuthErrorMessage(error: unknown): string {
   const code = (error as AuthError | undefined)?.code;
@@ -72,8 +138,18 @@ export default function App() {
   const [bankState, setBankState] = useState<BankState | null>(null);
   const [accountNumber, setAccountNumber] = useState<string | null>(null);
   const [amountInput, setAmountInput] = useState('');
+  const [myQrVisible, setMyQrVisible] = useState(false);
+  const [scannerVisible, setScannerVisible] = useState(false);
+  const [hasScannedCurrentSession, setHasScannedCurrentSession] = useState(false);
+  const [payModalVisible, setPayModalVisible] = useState(false);
+  const [payAccountNumber, setPayAccountNumber] = useState('');
+  const [payAmountInput, setPayAmountInput] = useState('');
+  const [payStatus, setPayStatus] = useState<{ type: 'error' | 'success'; message: string } | null>(null);
+  const [successVisible, setSuccessVisible] = useState(false);
+  const [successMessage, setSuccessMessage] = useState('');
   const [bankLoading, setBankLoading] = useState(false);
   const [status, setStatus] = useState<{ type: 'error' | 'success'; message: string } | null>(null);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
   useEffect(() => {
     if (!auth) {
@@ -114,7 +190,6 @@ export default function App() {
   }, [currentUser]);
 
   const authDisabled = useMemo(() => authLoading, [authLoading]);
-
   const onEmailAuth = async () => {
     setStatus(null);
 
@@ -200,6 +275,97 @@ export default function App() {
       setStatus({
         type: 'error',
         message: error instanceof Error ? error.message : 'Failed to add money.',
+      });
+    } finally {
+      setBankLoading(false);
+    }
+  };
+
+  const onCopyAccountNumber = async () => {
+    if (!accountNumber) {
+      setStatus({ type: 'error', message: 'Account number not available yet.' });
+      return;
+    }
+
+    await Clipboard.setStringAsync(accountNumber);
+    setStatus({ type: 'success', message: 'Account number copied.' });
+  };
+
+  const onOpenScanner = async () => {
+    setStatus(null);
+
+    if (Platform.OS === 'web') {
+      setStatus({ type: 'error', message: 'QR scanning is available on mobile app (Android/iOS).' });
+      return;
+    }
+
+    const permissionResult = cameraPermission?.granted
+      ? cameraPermission
+      : await requestCameraPermission();
+
+    if (!permissionResult.granted) {
+      setStatus({ type: 'error', message: 'Camera permission is required to scan QR.' });
+      return;
+    }
+
+    setHasScannedCurrentSession(false);
+    setScannerVisible(true);
+  };
+
+  const onQrScanned = async (event: BarcodeScanningResult) => {
+    if (hasScannedCurrentSession) {
+      return;
+    }
+
+    setHasScannedCurrentSession(true);
+    setScannerVisible(false);
+
+    const parsed = parsePaymentQr(event.data);
+    if (!parsed) {
+      setStatus({ type: 'error', message: 'Invalid QR. Scan a valid Bank payment QR.' });
+      return;
+    }
+
+    setPayAccountNumber(parsed.accountNumber);
+    setPayAmountInput(parsed.amount ? parsed.amount.toFixed(2) : '');
+    setPayStatus(null);
+    setPayModalVisible(true);
+  };
+
+  const onPayNow = async () => {
+    setStatus(null);
+    setPayStatus(null);
+
+    const amount = Number.parseFloat(payAmountInput.trim().replace(/,/g, '.'));
+    if (!payAccountNumber.trim()) {
+      setPayStatus({ type: 'error', message: 'Scan a QR first.' });
+      return;
+    }
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setPayStatus({ type: 'error', message: 'Enter a valid amount.' });
+      return;
+    }
+
+    setBankLoading(true);
+    try {
+      const result = await transferToAccountByNumber(payAccountNumber, amount, 'QR payment');
+      setBankState(result.state);
+
+      if (!result.ok) {
+        setPayStatus({ type: 'error', message: result.message });
+        return;
+      }
+
+      setPayModalVisible(false);
+      setPayAmountInput('');
+      setPayStatus(null);
+      setSuccessMessage(result.message);
+      setSuccessVisible(true);
+    } catch (error) {
+      setPayStatus({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Payment failed. Please try again.',
       });
     } finally {
       setBankLoading(false);
@@ -298,7 +464,8 @@ export default function App() {
   }
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
+    <View style={styles.screen}>
+    <ScrollView style={styles.screen} contentContainerStyle={styles.scrollContent}>
       <View style={styles.topRow}>
         <Text style={styles.title}>Bank App</Text>
         <TouchableOpacity style={styles.secondaryButton} onPress={onLogout} disabled={authLoading}>
@@ -308,7 +475,17 @@ export default function App() {
 
       <View style={styles.card}>
         <Text style={styles.label}>Account number</Text>
-        <Text style={styles.valueSmall}>{accountNumber ?? 'Generating...'}</Text>
+        <TouchableOpacity style={styles.copyRow} onPress={onCopyAccountNumber} disabled={!accountNumber}>
+          <Text style={styles.valueSmall}>{accountNumber ?? 'Generating...'}</Text>
+          {accountNumber ? <Text style={styles.copyHint}>Tap to copy</Text> : null}
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.label}>My QR</Text>
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => setMyQrVisible(true)}>
+          <Text style={styles.buttonText}>Show My QR</Text>
+        </TouchableOpacity>
       </View>
 
       <View style={styles.card}>
@@ -334,6 +511,14 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
+      <View style={styles.card}>
+        <Text style={styles.label}>Scan & Pay</Text>
+        <TouchableOpacity style={styles.secondaryButton} onPress={onOpenScanner} disabled={bankLoading}>
+          <Text style={styles.buttonText}>Scan QR</Text>
+        </TouchableOpacity>
+        <Text style={styles.label}>After scanning, enter amount and pay.</Text>
+      </View>
+
       <Text style={styles.sectionTitle}>Transactions</Text>
       {!bankState?.transactions.length ? (
         <Text style={styles.emptyText}>No transactions yet.</Text>
@@ -354,12 +539,110 @@ export default function App() {
         </Text>
       ) : null}
 
-      <StatusBar style="light" />
     </ScrollView>
+
+    <Modal visible={scannerVisible} transparent animationType="slide" onRequestClose={() => setScannerVisible(false)}>
+      <View style={styles.scannerOverlay}>
+        <View style={styles.scannerCard}>
+          <Text style={styles.sectionTitle}>Scan QR</Text>
+          <CameraView
+            style={styles.scannerCamera}
+            facing="back"
+            barcodeScannerSettings={{
+              barcodeTypes: ['qr'],
+            }}
+            onBarcodeScanned={onQrScanned}
+          />
+          <Text style={styles.label}>Point your camera at BankApp QR</Text>
+          <TouchableOpacity style={styles.secondaryButton} onPress={() => setScannerVisible(false)}>
+            <Text style={styles.buttonText}>Close Scanner</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    <Modal visible={myQrVisible} transparent animationType="slide" onRequestClose={() => setMyQrVisible(false)}>
+      <View style={styles.scannerOverlay}>
+        <View style={styles.scannerCard}>
+          <Text style={styles.sectionTitle}>My QR</Text>
+          {accountNumber ? (
+            <>
+              <View style={styles.qrContainer}>
+                <QRCode value={`bank://pay?account=${accountNumber}`} size={220} />
+              </View>
+              <Text style={styles.label}>Scan this QR to pay this account.</Text>
+            </>
+          ) : (
+            <Text style={styles.label}>Generating QR...</Text>
+          )}
+          <TouchableOpacity style={styles.secondaryButton} onPress={() => setMyQrVisible(false)}>
+            <Text style={styles.buttonText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    <Modal visible={payModalVisible} transparent animationType="slide" onRequestClose={() => setPayModalVisible(false)}>
+      <View style={styles.scannerOverlay}>
+        <View style={styles.scannerCard}>
+          <Text style={styles.sectionTitle}>Pay to Account</Text>
+          <Text style={styles.label}>Account: {payAccountNumber}</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Enter amount"
+            placeholderTextColor="#8a8aa3"
+            keyboardType="decimal-pad"
+            value={payAmountInput}
+            onChangeText={setPayAmountInput}
+          />
+          {payStatus ? (
+            <Text style={[styles.statusText, payStatus.type === 'error' ? styles.statusError : styles.statusSuccess]}>
+              {payStatus.message}
+            </Text>
+          ) : null}
+          <TouchableOpacity style={styles.primaryButton} onPress={onPayNow} disabled={bankLoading}>
+            {bankLoading ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.buttonText}>Pay</Text>}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={() => {
+              setPayStatus(null);
+              setPayModalVisible(false);
+            }}>
+            <Text style={styles.buttonText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    <Modal visible={successVisible} transparent animationType="fade" onRequestClose={() => setSuccessVisible(false)}>
+      <View style={styles.successOverlay}>
+        <View style={styles.successCard}>
+          <Text style={styles.successTitle}>Payment Successful</Text>
+          <Text style={styles.successText}>{successMessage}</Text>
+          <TouchableOpacity style={styles.successButton} onPress={() => setSuccessVisible(false)}>
+            <Text style={styles.buttonText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
+    <StatusBar style="light" />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+    backgroundColor: '#1a1a2e',
+  },
+  scrollContent: {
+    flexGrow: 1,
+    backgroundColor: '#1a1a2e',
+    paddingHorizontal: 16,
+    paddingVertical: 24,
+  },
   container: {
     flex: 1,
     backgroundColor: '#1a1a2e',
@@ -415,6 +698,20 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
+  copyRow: {
+    gap: 4,
+  },
+  copyHint: {
+    color: '#b8f4d5',
+    fontSize: 12,
+  },
+  qrContainer: {
+    alignSelf: 'center',
+    backgroundColor: '#ffffff',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 10,
+  },
   input: {
     borderWidth: 1,
     borderColor: '#2d2d4d',
@@ -452,6 +749,56 @@ const styles = StyleSheet.create({
   },
   statusSuccess: {
     color: '#b8f4d5',
+  },
+  scannerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  scannerCard: {
+    borderWidth: 1,
+    borderColor: '#2d2d4d',
+    borderRadius: 12,
+    backgroundColor: '#17172a',
+    padding: 14,
+    gap: 10,
+  },
+  scannerCamera: {
+    width: '100%',
+    height: 320,
+    borderRadius: 10,
+    overflow: 'hidden',
+  },
+  successOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  successCard: {
+    backgroundColor: '#16a34a',
+    borderRadius: 12,
+    padding: 18,
+    alignItems: 'center',
+  },
+  successTitle: {
+    color: '#ffffff',
+    fontSize: 24,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  successText: {
+    color: '#ecfdf5',
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 14,
+  },
+  successButton: {
+    backgroundColor: '#166534',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 20,
   },
   emptyText: {
     color: '#a0a0a0',

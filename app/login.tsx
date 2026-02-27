@@ -6,7 +6,6 @@ import {
     createUserWithEmailAndPassword,
     signInWithCredential,
     signInWithEmailAndPassword,
-    signInWithPopup,
     updateProfile,
     type AuthError,
 } from 'firebase/auth';
@@ -197,6 +196,12 @@ import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/fire
             return;
         }
 
+        if (!auth) {
+            showStatus('Authentication is not available on this device right now.', 'error');
+            setLoadingProfile(false);
+            return;
+        }
+
         try {
             setLoadingProfile(true);
             const credential = GoogleAuthProvider.credential(idToken, accessToken);
@@ -241,6 +246,11 @@ import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/fire
 
         if (!email.trim() || !password.trim()) {
         showStatus('Please enter email and password.', 'error');
+        return;
+        }
+
+        if (!auth) {
+        showStatus('Authentication is not available on this device right now.', 'error');
         return;
         }
 
@@ -295,9 +305,15 @@ import { auth, db, firebaseConfigured, missingFirebaseEnvKeys } from '@/lib/fire
     const onGoogleLogin = async () => {
         setAuthStatus(null);
 
+        if (!auth) {
+        showStatus('Authentication is not available on this device right now.', 'error');
+        return;
+        }
+
         if (Platform.OS === 'web') {
         try {
             setLoadingProfile(true);
+            const { signInWithPopup } = await import('firebase/auth');
             const provider = new GoogleAuthProvider();
             const result = await signInWithPopup(auth, provider);
 

@@ -192,6 +192,12 @@ export default function HomeScreen() {
   const subscriptions = currentUser ? [...localSubscriptions, ...cloudSubscriptions] : localSubscriptions;
 
   useEffect(() => {
+    if (!auth) {
+      setCurrentUser(null);
+      setAuthReady(true);
+      return;
+    }
+
     const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
       setAuthReady(true);
@@ -397,6 +403,11 @@ export default function HomeScreen() {
   }, [subscriptions]);
 
   const onAuthButtonPress = async () => {
+    if (!auth) {
+      setStatus({ type: 'error', message: 'Authentication is not available on this device right now.' });
+      return;
+    }
+
     if (!currentUser) {
       router.push('/login');
       return;

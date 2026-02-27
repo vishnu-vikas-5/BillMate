@@ -4,21 +4,21 @@ import { StatusBar } from 'expo-status-bar';
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 
 import {
-  addVirtualMoney,
-  getBankState,
-  getLinkedBankAccountInfo,
-  type BankState,
-  type LinkedBankAccountInfo,
+    addVirtualMoney,
+    getBankState,
+    getLinkedBankAccountInfo,
+    type BankState,
+    type LinkedBankAccountInfo,
 } from '@/lib/bank';
 import { auth } from '@/lib/firebase';
 
@@ -48,6 +48,12 @@ export default function BankScreen() {
   }, []);
 
   useEffect(() => {
+    if (!auth) {
+      setCurrentUser(null);
+      setAuthReady(true);
+      return;
+    }
+
     const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
       setAuthReady(true);
@@ -70,6 +76,11 @@ export default function BankScreen() {
 
   const onAuthButtonPress = async () => {
     setStatus(null);
+
+    if (!auth) {
+      setStatus({ type: 'error', message: 'Authentication is not available on this device right now.' });
+      return;
+    }
 
     if (!currentUser) {
       router.push('/login');

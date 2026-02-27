@@ -210,6 +210,20 @@ async function saveCloudBankState(ownerUid: string, state: BankState): Promise<v
   );
 }
 
+async function persistStateForOwner(ownerContext: BankOwnerContext, state: BankState): Promise<void> {
+  if (ownerContext.cloudOwnerUid) {
+    try {
+      await saveCloudBankState(ownerContext.cloudOwnerUid, state);
+      return;
+    } catch {
+      await saveLocalBankState(ownerContext.localOwnerKey, state);
+      return;
+    }
+  }
+
+  await saveLocalBankState(ownerContext.localOwnerKey, state);
+}
+
 async function getUidByAccountNumber(accountNumber: string): Promise<string | null> {
   const normalized = normalizeAccountNumber(accountNumber);
   if (!normalized || !isValidAccountNumber(normalized)) {
@@ -367,7 +381,7 @@ export async function ensureBankAccountForUser(uid: string): Promise<string | nu
 }
 
 export async function ensureBankAccountForCurrentUser(): Promise<string | null> {
-  const currentUid = auth.currentUser?.uid;
+  const currentUid = auth?.currentUser?.uid;
   if (!currentUid) {
     return null;
   }
@@ -376,7 +390,7 @@ export async function ensureBankAccountForCurrentUser(): Promise<string | null> 
 }
 
 async function resolveBankOwnerContext(): Promise<BankOwnerContext> {
-  const currentUid = auth.currentUser?.uid;
+  const currentUid = auth?.currentUser?.uid;
   if (!currentUid) {
     return {
       cloudOwnerUid: null,
@@ -406,7 +420,7 @@ async function resolveBankOwnerContext(): Promise<BankOwnerContext> {
 }
 
 export async function getLinkedBankAccountInfo(): Promise<LinkedBankAccountInfo> {
-  const currentUid = auth.currentUser?.uid;
+  const currentUid = auth?.currentUser?.uid;
   if (!currentUid) {
     return {
       ownAccountNumber: null,
@@ -456,7 +470,7 @@ export async function linkBankAccountByNumber(
     };
   }
 
-  const currentUid = auth.currentUser?.uid;
+  const currentUid = auth?.currentUser?.uid;
   if (!currentUid) {
     return {
       ok: false,
@@ -483,7 +497,7 @@ export async function linkBankAccountByNumber(
 }
 
 export async function unlinkLinkedBankAccount(): Promise<LinkedBankAccountInfo> {
-  const currentUid = auth.currentUser?.uid;
+  const currentUid = auth?.currentUser?.uid;
   if (currentUid) {
     await AsyncStorage.removeItem(linkedAccountStorageKey(currentUid));
   }
@@ -586,4 +600,92 @@ export async function tryDeductVirtualMoney(
 
   await saveLocalBankState(ownerContext.localOwnerKey, nextState);
   return { ok: true, state: nextState };
+}
+
+export async function payToAccountByNumber(
+  accountNumber: string,
+  amount: number,
+  note = 'QR payment'
+): Promise<{ ok: boolean; state: BankState; message: string }> {
+  const currentUid = auth?.currentUser?.uid;
+  const payerState = await getBankState();
+
+  if (!currentUid) {
+    return { ok: false, state: payerState, message: 'Login required to make payment.' };
+  }
+
+  const normalizedAccountNumber = normalizeAccountNumber(accountNumber);
+  if (!normalizedAccountNumber || !isValidAccountNumber(normalizedAccountNumber)) {
+    return { ok: false, state: payerState, message: 'Invalid receiver account number.' };
+  }
+
+  const safeAmount = Number.isFinite(amount) ? amount : 0;
+  if (safeAmount <= 0) {
+    return { ok: false, state: payerState, message: 'Invalid amount.' };
+  }
+
+  const ownAccountNumber = await ensureBankAccountForUser(currentUid);
+  if (ownAccountNumber && normalizeAccountNumber(ownAccountNumber) === normalizedAccountNumber) {
+    return { ok: false, state: payerState, message: 'You cannot pay your own account.' };
+  }
+
+  if (payerState.balance < safeAmount) {
+    return {
+      ok: false,
+      state: payerState,
+      message: `Insufficient balance. Available: ${payerState.balance.toFixed(2)}`,
+    };
+  }
+
+  const recipientUid = await getUidByAccountNumber(normalizedAccountNumber);
+  if (!recipientUid) {
+    return { ok: false, state: payerState, message: 'Receiver account not found.' };
+  }
+
+  const payerOwnerContext = await resolveBankOwnerContext();
+  const payerNextState: BankState = {
+    balance: payerState.balance - safeAmount,
+    transactions: [
+      {
+        id: `tx-${Date.now()}-debit`,
+        type: 'debit',
+        amount: safeAmount,
+        note: `${note} to ${normalizedAccountNumber}`,
+        createdAt: new Date().toISOString(),
+      },
+      ...payerState.transactions,
+    ],
+  };
+
+  const recipientOwnerContext: BankOwnerContext = {
+    cloudOwnerUid: firebaseConfigured ? recipientUid : null,
+    localOwnerKey: `acc:${normalizedAccountNumber}`,
+  };
+
+  const recipientPreviousState = recipientOwnerContext.cloudOwnerUid
+    ? await ensureCloudBankDoc(recipientUid)
+    : await getLocalBankState(recipientOwnerContext.localOwnerKey);
+
+  const recipientNextState: BankState = {
+    balance: recipientPreviousState.balance + safeAmount,
+    transactions: [
+      {
+        id: `tx-${Date.now()}-credit`,
+        type: 'credit',
+        amount: safeAmount,
+        note: `${note} from ${ownAccountNumber ?? currentUid}`,
+        createdAt: new Date().toISOString(),
+      },
+      ...recipientPreviousState.transactions,
+    ],
+  };
+
+  await persistStateForOwner(payerOwnerContext, payerNextState);
+  await persistStateForOwner(recipientOwnerContext, recipientNextState);
+
+  return {
+    ok: true,
+    state: payerNextState,
+    message: `Paid ${safeAmount.toFixed(2)} to ${normalizedAccountNumber}`,
+  };
 }
